@@ -1,0 +1,310 @@
+From e221dc6831c4960950d5370afea982d233a1b92b Mon Sep 17 00:00:00 2001
+From: VoidChecksum <markuskvam28b@gmail.com>
+Date: Thu, 11 Jun 2026 21:39:42 +0200
+Subject: [PATCH 3/4] accel/rocket: add support for the RK3576
+
+The RK3576 NPU is the same RKNN IP as in the RK3588, with two cores
+instead of three. Job submission and the command stream are unchanged,
+but completion signalling differs: on the RK3576 the PC_DONE bits
+(INTERRUPT_RAW_STATUS bits 28 and 29) are read-only in INTERRUPT_MASK,
+so completion cannot be routed to the GIC, and OPERATION_ENABLE does
+not clear when a job finishes either. Waiting for the DPU interrupt as
+on RK3588 means every job times out and takes the whole NPU down with
+it.
+
+Add per-SoC match data and, for SoCs that cannot deliver a completion
+interrupt, poll INTERRUPT_RAW_STATUS for the PC_DONE bits from a 1 ms
+hrtimer, deferring the existing completion path to a work item. The
+RK3588 path is unchanged.
+
+The completion behaviour was diagnosed on a Radxa ROCK 4D by Jiaxing
+Hu, whose out-of-tree bring-up patches first proved MobileNetV1
+inference working through Mesa/Teflon on this SoC, and matches the job
+timeouts Nicolas Frattaroli reported on RK3576 during early rocket
+reviews.
+
+Suggested-by: Jiaxing Hu <huhuvmb88@gmail.com>
+Link: https://github.com/gahingwoo/linux-rk3576-npu
+Link: https://lore.kernel.org/dri-devel/2950819.ElGaqSPkdT@workhorse/
+Signed-off-by: VoidChecksum <markuskvam28b@gmail.com>
+---
+ drivers/accel/rocket/rocket_core.h   | 16 +++++
+ drivers/accel/rocket/rocket_device.c | 12 +++-
+ drivers/accel/rocket/rocket_drv.c    | 12 +++-
+ drivers/accel/rocket/rocket_job.c    | 87 +++++++++++++++++++++++++++-
+ 4 files changed, 120 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index f6d738285..b55c64ea2 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -6,9 +6,11 @@
+ 
+ #include <drm/gpu_scheduler.h>
+ #include <linux/clk.h>
++#include <linux/hrtimer.h>
+ #include <linux/io.h>
+ #include <linux/mutex_types.h>
+ #include <linux/reset.h>
++#include <linux/workqueue.h>
+ 
+ #include "rocket_registers.h"
+ 
+@@ -27,9 +29,18 @@
+ #define rocket_core_writel(core, reg, value) \
+ 	writel(value, (core)->core_iomem + (REG_CORE_##reg) - REG_CORE_S_STATUS)
+ 
++struct rocket_soc_data {
++	/*
++	 * Job completion can't be signalled through the interrupt line, poll
++	 * for it instead. See rocket_pc_done_poll().
++	 */
++	bool pc_done_poll;
++};
++
+ struct rocket_core {
+ 	struct device *dev;
+ 	struct rocket_device *rdev;
++	const struct rocket_soc_data *soc;
+ 	unsigned int index;
+ 
+ 	int irq;
+@@ -52,6 +63,11 @@ struct rocket_core {
+ 		atomic_t pending;
+ 	} reset;
+ 
++	struct {
++		struct hrtimer timer;
++		struct work_struct work;
++	} pc_done;
++
+ 	struct drm_gpu_scheduler sched;
+ 	u64 fence_context;
+ 	u64 emit_seqno;
+diff --git a/drivers/accel/rocket/rocket_device.c b/drivers/accel/rocket/rocket_device.c
+index 46e6ee1e7..70323c567 100644
+--- a/drivers/accel/rocket/rocket_device.c
++++ b/drivers/accel/rocket/rocket_device.c
+@@ -10,6 +10,11 @@
+ 
+ #include "rocket_device.h"
+ 
++static const char * const rocket_core_compatibles[] = {
++	"rockchip,rk3576-rknn-core",
++	"rockchip,rk3588-rknn-core",
++};
++
+ struct rocket_device *rocket_device_init(struct platform_device *pdev,
+ 					 const struct drm_driver *rocket_drm_driver)
+ {
+@@ -27,9 +32,10 @@ struct rocket_device *rocket_device_init(struct platform_device *pdev,
+ 	ddev = &rdev->ddev;
+ 	dev_set_drvdata(dev, rdev);
+ 
+-	for_each_compatible_node(core_node, NULL, "rockchip,rk3588-rknn-core")
+-		if (of_device_is_available(core_node))
+-			num_cores++;
++	for (unsigned int i = 0; i < ARRAY_SIZE(rocket_core_compatibles); i++)
++		for_each_compatible_node(core_node, NULL, rocket_core_compatibles[i])
++			if (of_device_is_available(core_node))
++				num_cores++;
+ 
+ 	rdev->cores = devm_kcalloc(dev, num_cores, sizeof(*rdev->cores), GFP_KERNEL);
+ 	if (!rdev->cores)
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index 8bbbce594..51a373793 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -12,6 +12,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ 
+ #include "rocket_device.h"
+ #include "rocket_drv.h"
+@@ -176,6 +177,7 @@ static int rocket_probe(struct platform_device *pdev)
+ 
+ 	rdev->cores[core].rdev = rdev;
+ 	rdev->cores[core].dev = &pdev->dev;
++	rdev->cores[core].soc = device_get_match_data(&pdev->dev);
+ 	rdev->cores[core].index = core;
+ 
+ 	rdev->num_cores++;
+@@ -213,8 +215,16 @@ static void rocket_remove(struct platform_device *pdev)
+ 	}
+ }
+ 
++static const struct rocket_soc_data rk3576_soc_data = {
++	.pc_done_poll = true,
++};
++
++static const struct rocket_soc_data rk3588_soc_data = {
++};
++
+ static const struct of_device_id dt_match[] = {
+-	{ .compatible = "rockchip,rk3588-rknn-core" },
++	{ .compatible = "rockchip,rk3576-rknn-core", .data = &rk3576_soc_data },
++	{ .compatible = "rockchip,rk3588-rknn-core", .data = &rk3588_soc_data },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, dt_match);
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index ac51bff39..5a108d70f 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -7,6 +7,7 @@
+ #include <drm/drm_file.h>
+ #include <drm/drm_gem.h>
+ #include <drm/rocket_accel.h>
++#include <linux/hrtimer.h>
+ #include <linux/interrupt.h>
+ #include <linux/iommu.h>
+ #include <linux/platform_device.h>
+@@ -20,6 +21,19 @@
+ 
+ #define JOB_TIMEOUT_MS 500
+ 
++/*
++ * On the RK3576, job completion is only visible as the PC_DONE bits going
++ * high in INTERRUPT_RAW_STATUS: the corresponding bits in INTERRUPT_MASK are
++ * read-only on that SoC, so completion cannot be routed to the GIC as an
++ * interrupt. Cores with rocket_soc_data.pc_done_poll set poll for these bits
++ * instead, see rocket_pc_done_poll().
++ */
++#define PC_INTERRUPT_RAW_STATUS_PC_DONE_0	0x10000000
++#define PC_INTERRUPT_RAW_STATUS_PC_DONE_1	0x20000000
++#define PC_INTERRUPT_CLEAR_PC_DONE_0		0x10000000
++#define PC_INTERRUPT_CLEAR_PC_DONE_1		0x20000000
++#define PC_DONE_POLL_PERIOD_NS			(1 * NSEC_PER_MSEC)
++
+ static struct rocket_job *
+ to_rocket_job(struct drm_sched_job *sched_job)
+ {
+@@ -137,8 +151,21 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
+ 	rocket_pc_writel(core, REGISTER_AMOUNTS,
+ 			 PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+ 
+-	rocket_pc_writel(core, INTERRUPT_MASK, PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1);
+-	rocket_pc_writel(core, INTERRUPT_CLEAR, PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1);
++	if (core->soc->pc_done_poll) {
++		/*
++		 * Completion cannot raise an interrupt on this SoC, keep
++		 * everything masked and clear stale completion status.
++		 */
++		rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
++		rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff |
++				 PC_INTERRUPT_CLEAR_PC_DONE_0 |
++				 PC_INTERRUPT_CLEAR_PC_DONE_1);
++	} else {
++		rocket_pc_writel(core, INTERRUPT_MASK,
++				 PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1);
++		rocket_pc_writel(core, INTERRUPT_CLEAR,
++				 PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1);
++	}
+ 
+ 	rocket_pc_writel(core, TASK_CON, PC_TASK_CON_RESERVED_0(1) |
+ 					 PC_TASK_CON_TASK_COUNT_CLEAR(1) |
+@@ -150,6 +177,10 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
+ 	rocket_pc_writel(core, OPERATION_ENABLE, PC_OPERATION_ENABLE_OP_EN(1));
+ 
+ 	dev_dbg(core->dev, "Submitted regcmd at 0x%llx to core %d", task->regcmd, core->index);
++
++	if (core->soc->pc_done_poll)
++		hrtimer_start(&core->pc_done.timer, ns_to_ktime(PC_DONE_POLL_PERIOD_NS),
++			      HRTIMER_MODE_REL);
+ }
+ 
+ static int rocket_acquire_object_fences(struct drm_gem_object **bos,
+@@ -328,10 +359,15 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 
+ static void rocket_job_handle_irq(struct rocket_core *core)
+ {
++	u32 clear = 0x1ffff;
++
++	if (core->soc->pc_done_poll)
++		clear |= PC_INTERRUPT_CLEAR_PC_DONE_0 | PC_INTERRUPT_CLEAR_PC_DONE_1;
++
+ 	pm_runtime_mark_last_busy(core->dev);
+ 
+ 	rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
+-	rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
++	rocket_pc_writel(core, INTERRUPT_CLEAR, clear);
+ 
+ 	scoped_guard(mutex, &core->job_lock)
+ 		if (core->in_flight_job) {
+@@ -347,12 +383,46 @@ static void rocket_job_handle_irq(struct rocket_core *core)
+ 		}
+ }
+ 
++/*
++ * OPERATION_ENABLE doesn't clear on job completion on SoCs that need
++ * pc_done_poll, and no completion interrupt is available, so the only
++ * completion signal is the PC_DONE bits in INTERRUPT_RAW_STATUS. Poll for
++ * them and run the regular completion path from a work item.
++ */
++static enum hrtimer_restart rocket_pc_done_poll(struct hrtimer *timer)
++{
++	struct rocket_core *core = container_of(timer, struct rocket_core, pc_done.timer);
++	u32 raw_status = rocket_pc_readl(core, INTERRUPT_RAW_STATUS);
++
++	if (raw_status & (PC_INTERRUPT_RAW_STATUS_PC_DONE_0 |
++			  PC_INTERRUPT_RAW_STATUS_PC_DONE_1)) {
++		schedule_work(&core->pc_done.work);
++		return HRTIMER_NORESTART;
++	}
++
++	hrtimer_forward_now(timer, ns_to_ktime(PC_DONE_POLL_PERIOD_NS));
++	return HRTIMER_RESTART;
++}
++
++static void rocket_pc_done_work(struct work_struct *work)
++{
++	struct rocket_core *core = container_of(work, struct rocket_core, pc_done.work);
++
++	rocket_job_handle_irq(core);
++}
++
+ static void
+ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ {
+ 	if (!atomic_read(&core->reset.pending))
+ 		return;
+ 
++	/* Make sure the completion poll doesn't race with the reset. */
++	if (core->soc->pc_done_poll) {
++		hrtimer_cancel(&core->pc_done.timer);
++		cancel_work_sync(&core->pc_done.work);
++	}
++
+ 	drm_sched_stop(&core->sched, bad);
+ 
+ 	/*
+@@ -449,6 +519,12 @@ int rocket_job_init(struct rocket_core *core)
+ 	spin_lock_init(&core->fence_lock);
+ 	mutex_init(&core->job_lock);
+ 
++	if (core->soc->pc_done_poll) {
++		hrtimer_setup(&core->pc_done.timer, rocket_pc_done_poll, CLOCK_MONOTONIC,
++			      HRTIMER_MODE_REL);
++		INIT_WORK(&core->pc_done.work, rocket_pc_done_work);
++	}
++
+ 	core->irq = platform_get_irq(to_platform_device(core->dev), 0);
+ 	if (core->irq < 0)
+ 		return core->irq;
+@@ -489,6 +565,11 @@ void rocket_job_fini(struct rocket_core *core)
+ {
+ 	drm_sched_fini(&core->sched);
+ 
++	if (core->soc->pc_done_poll) {
++		hrtimer_cancel(&core->pc_done.timer);
++		cancel_work_sync(&core->pc_done.work);
++	}
++
+ 	cancel_work_sync(&core->reset.work);
+ 	destroy_workqueue(core->reset.wq);
+ }
+-- 
+2.53.0
+

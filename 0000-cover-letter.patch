@@ -1,0 +1,89 @@
+From b4db5c498e52e71e121c54f664fe73017076b2d8 Mon Sep 17 00:00:00 2001
+From: VoidChecksum <markuskvam28b@gmail.com>
+Date: Thu, 11 Jun 2026 21:40:12 +0200
+Subject: [PATCH RFC 0/4] accel/rocket: add support for the RK3576 NPU
+
+This adds RK3576 support to the rocket driver: binding, driver match
+data, and the SoC dtsi nodes.
+
+The RK3576 carries the same RKNN IP as the RK3588 with two cores
+instead of three. Three things differ and are handled here:
+
+ - Job completion cannot be delivered as an interrupt: the PC_DONE
+   bits in INTERRUPT_MASK are read-only on this SoC and
+   OPERATION_ENABLE does not clear on completion. Patch 3 adds per-SoC
+   match data and polls INTERRUPT_RAW_STATUS for the PC_DONE bits from
+   a 1 ms hrtimer on affected SoCs. This matches the "job timeouts
+   followed by a full SoC lock-up" Nicolas reported on RK3576 during
+   the v2 review of rocket [1].
+
+ - There is no NPU SRAM rail, so patch 1 makes sram-supply conditional
+   in the binding.
+
+ - The clk_bulk array in rocket_core_init() never sets .id, so every
+   entry resolves to the node's first clock. Harmless on RK3588 as
+   things stand, fatal on RK3576 where hclk stays gated. Patch 2 looks
+   the clocks up by the names the binding has always required.
+
+The register layout in patch 4 (per-core pc/cna/core split with the
+IOMMU inside the hole at core base + 0x2000 — the layout that led to
+the reg split discussion during review [2][3]) is cross-checked
+against the vendor BSP devicetree, and core 0 is confirmed on
+hardware: Jiaxing Hu has MobileNetV1 running through Mesa/Teflon on a
+Radxa ROCK 4D with an equivalent out-of-tree series [4]. This series
+is an independent implementation written against mainline, with the
+completion-polling approach and the clock findings credited to that
+bring-up work.
+
+Marked RFC because I could only compile-test: I don't have RK3576
+hardware. Build coverage: rocket builds clean as a module with W=1 on
+arm64 defconfig, all ten rk3576 board dtbs build without new warnings,
+and dt_binding_check / CHECK_DTBS pass on the touched schema (including
+a negative test that sram-supply is now rejected for the RK3576
+compatible).
+
+Known open items, deliberately not in this series:
+
+ - The rknn nodes stay disabled. Enabling a core today requires
+   keeping the NPU rail always on, because the power-domain chain
+   status on the NPU hierarchy never asserts after power-off and
+   rockchip-pm-domain then cannot power-cycle it. That needs either a
+   pmdomain fix or domain-supply support, and is being investigated by
+   the people with hardware [4]. Board enablement should follow once
+   that is settled.
+ - Whether the RKNN BIU resets want to be cycled by the power domain
+   rather than held by the core driver is part of the same discussion.
+ - The boot firmware can leave an orphaned page fault on IOMMU bank 0,
+   which currently trips rk_iommu's stall handling; fixes for that are
+   in [4] and belong to the IOMMU driver, not here.
+
+TODO (TRM/hardware access needed): the OPP table / clock rates for the
+cores are not included; the vendor tree programs CLK_RKNN_DSU0 via SCMI
+with board-fused voltages, and I did not want to guess at frequencies
+that nobody can validate right now.
+
+Tested on: nothing physical, see above. If you have a ROCK 4D, Sige5
+or NanoPi M5, testing reports are very welcome.
+
+[1] https://lore.kernel.org/dri-devel/2950819.ElGaqSPkdT@workhorse/
+[2] https://lore.kernel.org/dri-devel/14333638.uLZWGnKmhe@workhorse/
+[3] https://lore.kernel.org/dri-devel/CAAObsKAkMhgQsi6hLjbfS5wDaUz-hPQiZn7dVvn+6kDv0_jo9Q@mail.gmail.com/
+[4] https://github.com/gahingwoo/linux-rk3576-npu
+
+VoidChecksum (4):
+  dt-bindings: npu: rockchip,rk3588-rknn-core: add RK3576
+  accel/rocket: look up core clocks by name
+  accel/rocket: add support for the RK3576
+  arm64: dts: rockchip: add RKNN core nodes to rk3576
+
+ .../npu/rockchip,rk3588-rknn-core.yaml        | 20 ++++-
+ arch/arm64/boot/dts/rockchip/rk3576.dtsi      | 58 +++++++++++++
+ drivers/accel/rocket/rocket_core.c            |  4 +
+ drivers/accel/rocket/rocket_core.h            | 16 ++++
+ drivers/accel/rocket/rocket_device.c          | 12 ++-
+ drivers/accel/rocket/rocket_drv.c             | 12 ++-
+ drivers/accel/rocket/rocket_job.c             | 87 ++++++++++++++++++-
+ 7 files changed, 200 insertions(+), 9 deletions(-)
+
+-- 
+2.53.0

@@ -1,0 +1,50 @@
+From 431dbe8d647cb1692ad718195dfbdfbb1a74a9af Mon Sep 17 00:00:00 2001
+From: VoidChecksum <markuskvam28b@gmail.com>
+Date: Thu, 11 Jun 2026 21:39:41 +0200
+Subject: [PATCH 2/4] accel/rocket: look up core clocks by name
+
+The clk_bulk_data array passed to devm_clk_bulk_get() never has its
+.id fields set, so every element resolves through clk_get(dev, NULL),
+which on DT platforms returns the first clock of the node. The driver
+ends up with four references to "aclk" and never touches hclk, npu or
+pclk.
+
+This has gone unnoticed on RK3588 because the clocks the cores need are
+kept running by other means there (the NPU power domains list them, and
+the "npu" clock is an SCMI clock managed by firmware), but it breaks on
+SoCs where the core actually depends on the driver enabling its own
+bus clocks, and it makes the clk_bulk PM callbacks operate on the wrong
+clock either way.
+
+The binding has always required clock-names = "aclk", "hclk", "npu",
+"pclk", so look the clocks up by name.
+
+Jiaxing Hu tracked this down during RK3576 bring-up, where probing the
+core hangs with hclk gated.
+
+Fixes: ed98261b4168 ("accel/rocket: Add a new driver for Rockchip's NPU")
+Reported-by: Jiaxing Hu <huhuvmb88@gmail.com>
+Closes: https://github.com/flipperdevices/flipperone-linux-build-scripts/issues/55
+Signed-off-by: VoidChecksum <markuskvam28b@gmail.com>
+---
+ drivers/accel/rocket/rocket_core.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/accel/rocket/rocket_core.c b/drivers/accel/rocket/rocket_core.c
+index b3b2fa9ba..5dd260bac 100644
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -28,6 +28,10 @@ int rocket_core_init(struct rocket_core *core)
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get resets for core %d\n", core->index);
+ 
++	core->clks[0].id = "aclk";
++	core->clks[1].id = "hclk";
++	core->clks[2].id = "npu";
++	core->clks[3].id = "pclk";
+ 	err = devm_clk_bulk_get(dev, ARRAY_SIZE(core->clks), core->clks);
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get clocks for core %d\n", core->index);
+-- 
+2.53.0
+

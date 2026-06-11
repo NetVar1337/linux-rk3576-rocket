@@ -1,0 +1,68 @@
+From 5d29349baed4d29116960c15adc95500492a6dde Mon Sep 17 00:00:00 2001
+From: VoidChecksum <markuskvam28b@gmail.com>
+Date: Thu, 11 Jun 2026 21:31:37 +0200
+Subject: [PATCH 1/4] dt-bindings: npu: rockchip,rk3588-rknn-core: add RK3576
+
+The RK3576 contains the same RKNN NPU IP as the RK3588, with two cores
+instead of three and without a dedicated NPU SRAM supply rail.
+
+Add a compatible string for it, and make sram-supply conditional on the
+SoC: still required on RK3588, disallowed on SoCs that have no such
+rail. The rest of the binding maps onto the RK3576 unchanged: the
+per-core pc/cna/core register split, one IOMMU reference per core, the
+aclk/hclk/npu/pclk clock set and the two core resets all have direct
+RK3576 equivalents.
+
+Signed-off-by: VoidChecksum <markuskvam28b@gmail.com>
+---
+ .../npu/rockchip,rk3588-rknn-core.yaml        | 20 +++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml b/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
+index caca2a490..fbef00031 100644
+--- a/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
++++ b/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
+@@ -21,6 +21,7 @@ properties:
+ 
+   compatible:
+     enum:
++      - rockchip,rk3576-rknn-core
+       - rockchip,rk3588-rknn-core
+ 
+   reg:
+@@ -61,7 +62,10 @@ properties:
+       - const: srst_a
+       - const: srst_h
+ 
+-  sram-supply: true
++  sram-supply:
++    description:
++      Supply for the NPU SRAM. Only present on SoCs that feed the NPU SRAM
++      from a dedicated rail, such as the RK3588.
+ 
+ required:
+   - compatible
+@@ -75,7 +79,19 @@ required:
+   - resets
+   - reset-names
+   - npu-supply
+-  - sram-supply
++
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: rockchip,rk3588-rknn-core
++    then:
++      required:
++        - sram-supply
++    else:
++      properties:
++        sram-supply: false
+ 
+ additionalProperties: false
+ 
+-- 
+2.53.0
+

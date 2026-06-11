@@ -1,0 +1,107 @@
+From b4db5c498e52e71e121c54f664fe73017076b2d8 Mon Sep 17 00:00:00 2001
+From: VoidChecksum <markuskvam28b@gmail.com>
+Date: Thu, 11 Jun 2026 21:39:42 +0200
+Subject: [PATCH 4/4] arm64: dts: rockchip: add RKNN core nodes to rk3576
+
+Add the two NPU cores of the RK3576 and their IOMMUs, for use by the
+rocket accel driver.
+
+The register layout follows the same scheme as the RK3588: each core
+exposes pc/cna/core register blocks, with the core's IOMMU sitting
+inside the hole at core base + 0x2000. That layout (core 1 at
+0x27708000, IOMMU banks at 0x27702000/0x27702100 and
+0x2770a000/0x2770a100) and the per-core interrupts (GIC SPI 247/248)
+match the vendor BSP devicetree, and core 0 has been confirmed on a
+Radxa ROCK 4D by Jiaxing Hu, including MobileNetV1 inference through
+Mesa/Teflon.
+
+The "npu" clock is CLK_RKNN_DSU0, which clocks both cores (the vendor
+kernel manages it through SCMI; here it is taken from the CRU). There
+is no per-core hclk gate on this SoC, so both cores reference
+HCLK_RKNN_ROOT, and PCLK_NPUTOP_ROOT fills the "pclk" slot the binding
+requires. The "srst_h" reset slot maps to the RKNN BIU resets, the
+closest equivalent of the RK3588's SRST_H_RKNNx.
+
+The nodes are disabled: enabling them needs a board-level npu-supply,
+and the runtime power-domain sequencing of the NPU hierarchy on this
+SoC is still being sorted out, so board enablement is left for a
+follow-up.
+
+Link: https://github.com/gahingwoo/linux-rk3576-npu
+Signed-off-by: VoidChecksum <markuskvam28b@gmail.com>
+---
+ arch/arm64/boot/dts/rockchip/rk3576.dtsi | 58 ++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3576.dtsi b/arch/arm64/boot/dts/rockchip/rk3576.dtsi
+index 28175d820..0c3f32143 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3576.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3576.dtsi
+@@ -1261,6 +1261,64 @@ power-domain@RK3576_PD_VO1 {
+ 			};
+ 		};
+ 
++		rknn_core_0: npu@27700000 {
++			compatible = "rockchip,rk3576-rknn-core";
++			reg = <0x0 0x27700000 0x0 0x1000>,
++			      <0x0 0x27701000 0x0 0x1000>,
++			      <0x0 0x27703000 0x0 0x1000>;
++			reg-names = "pc", "cna", "core";
++			interrupts = <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cru ACLK_RKNN0>, <&cru HCLK_RKNN_ROOT>,
++				 <&cru CLK_RKNN_DSU0>, <&cru PCLK_NPUTOP_ROOT>;
++			clock-names = "aclk", "hclk", "npu", "pclk";
++			resets = <&cru SRST_A_RKNN0>, <&cru SRST_A_RKNN0_BIU>;
++			reset-names = "srst_a", "srst_h";
++			power-domains = <&power RK3576_PD_NPU0>;
++			iommus = <&rknn_mmu_0>;
++			status = "disabled";
++		};
++
++		rknn_mmu_0: iommu@27702000 {
++			compatible = "rockchip,rk3576-iommu", "rockchip,rk3568-iommu";
++			reg = <0x0 0x27702000 0x0 0x100>,
++			      <0x0 0x27702100 0x0 0x100>;
++			interrupts = <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cru ACLK_RKNN0>, <&cru HCLK_RKNN_ROOT>;
++			clock-names = "aclk", "iface";
++			power-domains = <&power RK3576_PD_NPU0>;
++			#iommu-cells = <0>;
++			status = "disabled";
++		};
++
++		rknn_core_1: npu@27708000 {
++			compatible = "rockchip,rk3576-rknn-core";
++			reg = <0x0 0x27708000 0x0 0x1000>,
++			      <0x0 0x27709000 0x0 0x1000>,
++			      <0x0 0x2770b000 0x0 0x1000>;
++			reg-names = "pc", "cna", "core";
++			interrupts = <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cru ACLK_RKNN1>, <&cru HCLK_RKNN_ROOT>,
++				 <&cru CLK_RKNN_DSU0>, <&cru PCLK_NPUTOP_ROOT>;
++			clock-names = "aclk", "hclk", "npu", "pclk";
++			resets = <&cru SRST_A_RKNN1>, <&cru SRST_A_RKNN1_BIU>;
++			reset-names = "srst_a", "srst_h";
++			power-domains = <&power RK3576_PD_NPU1>;
++			iommus = <&rknn_mmu_1>;
++			status = "disabled";
++		};
++
++		rknn_mmu_1: iommu@2770a000 {
++			compatible = "rockchip,rk3576-iommu", "rockchip,rk3568-iommu";
++			reg = <0x0 0x2770a000 0x0 0x100>,
++			      <0x0 0x2770a100 0x0 0x100>;
++			interrupts = <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cru ACLK_RKNN1>, <&cru HCLK_RKNN_ROOT>;
++			clock-names = "aclk", "iface";
++			power-domains = <&power RK3576_PD_NPU1>;
++			#iommu-cells = <0>;
++			status = "disabled";
++		};
++
+ 		gpu: gpu@27800000 {
+ 			compatible = "rockchip,rk3576-mali", "arm,mali-bifrost";
+ 			reg = <0x0 0x27800000 0x0 0x20000>;
+-- 
+2.53.0
+
